@@ -25,6 +25,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
 print(f"Found {jax.device_count()} devices.")
 
 from typing import Sequence
+import wandb
 import datetime
 from absl import app
 from flax.linen import partitioning as nn_partitioning
@@ -96,7 +97,26 @@ def record_scalar_metrics(metrics, step_time_delta, per_device_tflops, lr):
   })
   metrics['scalar'].update({'learning/current_learning_rate': lr })
 
+def write_metrics_wandb(metrics,step,config):
+  """Writes metrics to wandb"""
+  with jax.spmd_mode('allow_all'):
+    if jax.process_index() == 0:
+      for metric_name in metrics.get("scalar",[]):
+        wandb.log({metric_name: metrics["scalar"][metric_name]}, step=step)
+      for metric_name in metrics.get("scalars",[]):
+        wandb.log({metric_name: metrics["scalars"][metric_name]}, step=step)
 
+    full_log = step % config.log_period == 0
+
+    max_logging.log(f"completed step: {step}, seconds: {metrics['scalar']['perf/step_time_seconds']:.3f}, "
+          f"TFLOP/s: {metrics['scalar']['perf/per_device_tflops_per_sec']:.3f}, "
+          f"loss: {metrics['scalar']['learning/loss']:.3f}")
+
+    if full_log:
+      max_logging.log(
+          f"To see full metrics 'tensorboard --logdir={config.tensorboard_dir}'"
+      )
+      
 def write_metrics(writer, metrics, step, config):
   """Writes metrics to tensorboard"""
   with jax.spmd_mode('allow_all'):
@@ -322,7 +342,12 @@ def train_loop(config, state=None):
 
     new_time = datetime.datetime.now()
     record_scalar_metrics(metrics, new_time - last_step_completion,  per_device_tflops, learning_rate_schedule(step))
-    write_metrics(writer, metrics, step, config)
+    if config.use_wandb:
+      if jax.process_index() == 0:
+        write_metrics_wandb(metrics, step, config)
+        write_metrics(writer, metrics, step, config)
+    else:
+      write_metrics(writer, metrics, step, config)
     last_step_completion = new_time
 
     if step > 0 and step % config.save_period == 0 and checkpoint_manager is not None:
@@ -344,6 +369,10 @@ def train_loop(config, state=None):
 def main(argv: Sequence[str]) -> None:
   pyconfig.initialize(argv)
   os.environ["TFDS_DATA_DIR"] = pyconfig.config.dataset_path
+  if jax.process_index() == 0:
+    if pyconfig.config.use_wandb:
+      wandb.init(project=pyconfig.config.wandb_project, config=pyconfig.config, name=pyconfig.config.run_name)
+      wandb.config.update(pyconfig.config)
   debug_config = debug_configuration.DebugConfig(
     stack_trace_config = stack_trace_configuration.StackTraceConfig(
       collect_stack_trace = pyconfig.config.collect_stack_trace,

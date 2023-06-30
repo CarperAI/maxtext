@@ -18,3 +18,4 @@ tensorflow-datasets
 tensorboard-plugin-profile
 tensorflow-text
 tensorboardx
+wandb
